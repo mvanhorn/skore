@@ -4,9 +4,17 @@ from types import SimpleNamespace
 import mlflow
 import pandas as pd
 import pytest
+import skrub
 from mlflow.exceptions import MlflowException
+from mlflow.models import Model
+from numpy.testing import assert_allclose
+from sklearn.base import clone
+from sklearn.datasets import make_regression
+from sklearn.dummy import DummyRegressor
 from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import KFold
 
+from skore import CrossValidationReport, EstimatorReport
 from skore._plugins.mlflow import Project
 from skore._plugins.mlflow import project as project_module
 from skore._plugins.mlflow.project import (
@@ -15,6 +23,7 @@ from skore._plugins.mlflow.project import (
     format_date,
     report_type,
 )
+from skore._utils.skrub import find_fitted_estimators
 
 
 def test_format_date() -> None:
@@ -119,7 +128,14 @@ def test_log_model_falls_back_for_mlflow_2(monkeypatch) -> None:
 
     project_module._log_model(LinearRegression(), input_example=None, name="test")
 
-    assert len(calls) == 2
+    assert calls == [
+        {"input_example": None, "name": "test"},
+        {
+            "input_example": None,
+            "artifact_path": "test",
+            "pyfunc_predict_fn": "__skore_disabled_pyfunc__",
+        },
+    ]
 
 
 def test_log_model_reraises_unexpected_typeerror(monkeypatch) -> None:
@@ -354,3 +370,135 @@ class TestProject:
 
         with pytest.raises(LookupError):
             Project.delete(name=project.name, tracking_uri=tracking_uri)
+
+
+def _dataset_contexts(run) -> set[str]:
+    contexts = set()
+    for dataset_input in run.inputs.dataset_inputs:
+        for tag in dataset_input.tags:
+            if tag.key == "mlflow.data.context":
+                contexts.add(tag.value)
+    return contexts
+
+
+def _assert_native_skrub_model(run_id, tracking_uri, environment, expected) -> None:
+    model_dir = Path(
+        mlflow.artifacts.download_artifacts(
+            run_id=run_id,
+            artifact_path="model",
+            tracking_uri=tracking_uri,
+        )
+    )
+    logged = Model.load(str(model_dir))
+    assert "python_function" not in logged.flavors
+    assert logged.flavors["sklearn"]["serialization_format"] == "cloudpickle"
+    assert logged.signature is None
+
+    loaded = mlflow.sklearn.load_model(str(model_dir))
+    assert_allclose(loaded.predict(environment), expected)
+
+
+@pytest.fixture
+def skrub_regression_data():
+    """40-row regression learner from the MLflow sync failure report."""
+    X, y = make_regression(n_samples=40, n_features=3, random_state=0)
+    learner = skrub.X(X).skb.apply(DummyRegressor(), y=skrub.y(y)).skb.make_learner()
+    return learner, {"_skrub_X": X, "_skrub_y": y}
+
+
+def test_put_skrub_cross_validation(skrub_regression_data) -> None:
+    learner, data = skrub_regression_data
+    report = CrossValidationReport(learner, data=data, splitter=KFold(n_splits=2))
+    assert find_fitted_estimators(report.learner_) == []
+
+    project = Project("<project>")
+    project.put("dummy", report)
+
+    assert find_fitted_estimators(report.learner_) == []
+    assert not report.learner_.__sklearn_is_fitted__()
+
+    (metadata,) = project.summarize()
+    assert metadata["report_type"] == "cross-validation"
+    assert metadata["ml_task"] == "regression"
+    assert metadata["rmse_mean"] is not None
+    run = mlflow.get_run(metadata["id"])
+    assert run.info.status == "FINISHED"
+    assert run.data.tags["skore_status"] == "completed"
+    assert "rmse" in run.data.metrics
+    assert "rmse_std" in run.data.metrics
+    assert "fit_time" in run.data.metrics
+    assert run.inputs.dataset_inputs
+
+    report_dir = Path(
+        mlflow.artifacts.download_artifacts(
+            run_id=run.info.run_id,
+            tracking_uri=project.tracking_uri,
+        )
+    )
+    assert (report_dir / "report.pkl").exists()
+
+    # The logged model is a full-environment refit, not the unfitted source.
+    expected_model = clone(report.learner_).fit(report.input_data)
+    _assert_native_skrub_model(
+        run.info.run_id,
+        project.tracking_uri,
+        report.input_data,
+        expected_model.predict(report.input_data),
+    )
+    assert find_fitted_estimators(report.learner_) == []
+
+    children = mlflow.search_runs(
+        experiment_ids=[project.experiment_id],
+        filter_string=f"tags.mlflow.parentRunId = '{run.info.run_id}'",
+        output_format="list",
+    )
+    assert len(children) == 2
+    for child, split_report in zip(
+        sorted(children, key=lambda item: item.info.run_name),
+        report.reports_,
+        strict=True,
+    ):
+        assert child.info.status == "FINISHED"
+        assert child.info.run_name.startswith("split_")
+        assert "rmse" in child.data.metrics
+        assert "fit_time" in child.data.metrics
+        assert _dataset_contexts(child) == {"training", "evaluation"}
+        _assert_native_skrub_model(
+            child.info.run_id,
+            project.tracking_uri,
+            split_report.test_data,
+            split_report.estimator_.predict(split_report.test_data),
+        )
+
+
+def test_put_skrub_estimator(skrub_regression_data) -> None:
+    learner, data = skrub_regression_data
+    split = learner.data_op.skb.train_test_split(data, random_state=0)
+    report = EstimatorReport(
+        learner, train_data=split["train"], test_data=split["test"]
+    )
+    before = report.estimator_.predict(report.test_data)
+    fitted_ids = [id(est) for est in find_fitted_estimators(report.learner_)]
+
+    project = Project("<project>")
+    project.put("dummy", report)
+
+    assert_allclose(report.estimator_.predict(report.test_data), before)
+    assert fitted_ids == [id(est) for est in find_fitted_estimators(report.learner_)]
+
+    (metadata,) = project.summarize()
+    assert metadata["report_type"] == "estimator"
+    assert metadata["ml_task"] == "regression"
+    assert metadata["rmse"] is not None
+    run = mlflow.get_run(metadata["id"])
+    assert run.info.status == "FINISHED"
+    assert run.data.tags["skore_status"] == "completed"
+    assert "rmse" in run.data.metrics
+    assert "fit_time" in run.data.metrics
+    assert _dataset_contexts(run) == {"training", "evaluation"}
+    _assert_native_skrub_model(
+        run.info.run_id,
+        project.tracking_uri,
+        report.test_data,
+        before,
+    )

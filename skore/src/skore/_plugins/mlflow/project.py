@@ -30,6 +30,7 @@ from sklearn.base import BaseEstimator
 
 from skore import CrossValidationReport, EstimatorReport
 from skore._plugins.serde import externalize, internalize
+from skore._utils.skrub import is_skrub_learner
 
 from .reports import (
     Artifact,
@@ -468,9 +469,24 @@ class Project:
 
 ## Helpers for logging in MLFlow:
 
+# MLflow skips the pyfunc flavor when the model has no attribute with this name.
+# Skrub learners predict on an environment dict, so a tabular pyfunc endpoint
+# would be invalid. The same sentinel is used for the MLflow 2.x ``name`` retry.
+_DISABLED_PYFUNC_PREDICT_FN = "__skore_disabled_pyfunc__"
+
 
 def _log_model(model: BaseEstimator, input_example: Any, **kwargs: Any) -> None:
-    """Log a model using skops first, then cloudpickle as fallback."""
+    """Log a native estimator with the MLflow sklearn flavor.
+
+    Skrub learners are stored with cloudpickle and without a pyfunc flavor.
+    """
+    if is_skrub_learner(model):
+        kwargs.setdefault(
+            "serialization_format",
+            mlflow.sklearn.SERIALIZATION_FORMAT_CLOUDPICKLE,
+        )
+        kwargs.setdefault("pyfunc_predict_fn", _DISABLED_PYFUNC_PREDICT_FN)
+
     try:
         with (
             _filterwarnings(UserWarning, ".*Any type hint is inferred as AnyType.*"),
@@ -490,6 +506,10 @@ def _log_model(model: BaseEstimator, input_example: Any, **kwargs: Any) -> None:
                 "mlflow.sklearn",
                 r"Saving scikit-learn models in the pickle.*",
             ),
+            _suppress_log_warning(
+                "mlflow.sklearn",
+                rf"Model was missing function: {_DISABLED_PYFUNC_PREDICT_FN}",
+            ),
         ):
             mlflow.sklearn.log_model(
                 model,
@@ -501,7 +521,7 @@ def _log_model(model: BaseEstimator, input_example: Any, **kwargs: Any) -> None:
         if "unexpected keyword argument 'name'" not in str(exc):
             raise
         kwargs["artifact_path"] = kwargs.pop("name")
-        kwargs["pyfunc_predict_fn"] = "__skore_disabled_pyfunc__"
+        kwargs["pyfunc_predict_fn"] = _DISABLED_PYFUNC_PREDICT_FN
         return _log_model(model, input_example, **kwargs)
 
 

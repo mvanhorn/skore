@@ -9,6 +9,7 @@ from typing import Any, TypeAlias
 
 import matplotlib.pyplot as plt
 import mlflow.data
+import narwhals as nw
 import numpy as np
 import pandas as pd
 from mlflow.data.dataset import Dataset as MlFlowDatasetType
@@ -17,6 +18,7 @@ from sklearn.base import BaseEstimator, clone
 
 from skore import CrossValidationReport, EstimatorReport
 from skore._plugins import switch_plt_backend
+from skore._utils.skrub import is_skrub_learner
 
 ArrayLike: TypeAlias = pd.DataFrame | NDArray[np.generic]
 
@@ -62,10 +64,14 @@ class Tag:
 
 @dataclass
 class Model:
-    """Model payload."""
+    """Model payload.
+
+    ``input_example`` is omitted for estimators whose ``predict`` method does not
+    accept a tabular matrix (skrub learners take an environment dict).
+    """
 
     model: BaseEstimator
-    input_example: ArrayLike
+    input_example: ArrayLike | None
 
 
 CLF_METRICS = {
@@ -190,9 +196,9 @@ def iter_cv(report: CrossValidationReport) -> Generator[NestedLogItem, None, Non
     """Yield loggable objects for a cross-validation report."""
     yield from iter_cv_metrics(report)
 
-    estimator = clone(report.estimator).fit(report.X, report.y)
+    estimator, input_example = _refitted_estimator(report)
     yield Params(estimator.get_params())
-    yield Model(estimator, _sample_input_example(report.X))
+    yield Model(estimator, input_example)
 
     yield Artifact("data.summarize", _data_analyze_html(report))
 
@@ -223,7 +229,14 @@ def iter_estimator(report: EstimatorReport) -> Generator[LogItem, None, None]:
 
     estimator = report.estimator_
     yield Params(estimator.get_params())
-    yield Model(estimator, _sample_input_example(report.X_test))
+    # Keep the already fitted learner. Skrub ``predict`` expects an environment,
+    # so a materialized ``X`` cannot be used as an input example.
+    input_example = (
+        None
+        if is_skrub_learner(report.learner_)
+        else _sample_input_example(report.X_test)
+    )
+    yield Model(estimator, input_example)
 
     yield Artifact("data.summarize", _data_analyze_html(report))
 
@@ -237,6 +250,24 @@ def _data_analyze_html(report: CrossValidationReport | EstimatorReport) -> Any:
             return report.data.summarize()._repr_html_()
         finally:
             plt.close("all")
+
+
+def _refitted_estimator(
+    report: CrossValidationReport,
+) -> tuple[BaseEstimator, ArrayLike | None]:
+    """Clone and fit an estimator without mutating ``report``.
+
+    Skrub learners are fitted on the full environment (``input_data``), which can
+    contain variables besides the materialized ``X`` and ``y``. Reports built from
+    a :class:`~skrub.DataOp` expose that learner on ``learner_``.
+    """
+    fitted: BaseEstimator
+    if is_skrub_learner(report.learner_):
+        fitted = clone(report.learner_).fit(report.input_data)
+        return fitted, None
+
+    fitted = clone(report.estimator).fit(report.X, report.y)
+    return fitted, _sample_input_example(report.X)
 
 
 def _sample_input_example(X: ArrayLike, *, max_samples: int = 5) -> ArrayLike:
@@ -254,11 +285,40 @@ def _sample_input_example(X: ArrayLike, *, max_samples: int = 5) -> ArrayLike:
         return X[:max_samples]
 
 
+def _is_polars(data: Any) -> bool:
+    return bool(
+        nw.dependencies.is_polars_dataframe(data)
+        or nw.dependencies.is_polars_series(data)
+    )
+
+
+def _coerce_polars_to_pandas(data: Any) -> pd.DataFrame | pd.Series:
+    """Copy a polars frame or series to pandas."""
+    return nw.from_native(data, allow_series=True).to_pandas()
+
+
 def _dataset_from_Xy(
-    X: pd.DataFrame | NDArray[np.generic],
-    y: pd.DataFrame | pd.Series | NDArray[np.generic] | dict[str, NDArray[np.generic]],
+    X: Any,
+    y: Any,
     context: str | None = None,
 ) -> Dataset:
+    # Normalize at the logging boundary so the report keeps its original objects.
+    x_is_polars = _is_polars(X)
+    y_is_polars = not isinstance(y, dict) and _is_polars(y)
+    if x_is_polars:
+        X = _coerce_polars_to_pandas(X)
+    if y_is_polars:
+        y = _coerce_polars_to_pandas(y)
+    if (
+        (x_is_polars or y_is_polars)
+        and isinstance(X, pd.DataFrame)
+        and isinstance(y, (pd.DataFrame, pd.Series))
+        and len(X) == len(y)
+        and not X.index.equals(y.index)
+    ):
+        # Polars has no index; align by row position with the other frame.
+        y = y.set_axis(X.index)
+
     if isinstance(X, np.ndarray):
         if isinstance(y, pd.Series):
             y = y.to_numpy()

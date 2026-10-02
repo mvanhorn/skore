@@ -6,11 +6,14 @@ from unittest.mock import Mock
 import mlflow
 import pandas as pd
 import pytest
+import skrub
 from pandas.testing import assert_frame_equal
 from sklearn.datasets import make_regression
+from sklearn.dummy import DummyRegressor
 from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.model_selection import KFold
 
-from skore import EstimatorReport, Project, evaluate
+from skore import CrossValidationReport, EstimatorReport, Project, evaluate
 from skore._project.sync import synchronize
 
 
@@ -381,3 +384,47 @@ def test_sync_local_and_mlflow_bidirectionally(tmp_path, isolated_mlflow_trackin
     assert set(repeated.index) == expected_ids
     assert bool(repeated["direction"].isna().all())
     assert set(repeated["status"]) == {"skipped"}
+
+
+def test_sync_skrub_cv_report_from_local_to_mlflow(tmp_path, isolated_mlflow_tracking):
+    """Transfer a skrub cross-validation report and skip it on the next sync."""
+    X, y = make_regression(n_samples=40, n_features=3, random_state=0)
+    learner = skrub.X(X).skb.apply(DummyRegressor(), y=skrub.y(y)).skb.make_learner()
+    report = CrossValidationReport(
+        learner,
+        data={"_skrub_X": X, "_skrub_y": y},
+        splitter=KFold(n_splits=2),
+    )
+    local = Project(
+        name="sync-skrub",
+        mode="local",
+        workspace=tmp_path / "local",
+    )
+    mlflow_project = Project(
+        name="sync-skrub",
+        mode="mlflow",
+        tracking_uri=isolated_mlflow_tracking,
+    )
+    local.put("dummy", report)
+
+    result = local.sync(mlflow_project)
+
+    assert result.loc[report.id, "status"] == "transferred"
+    assert result.loc[report.id, "direction"] == "outbound"
+    frame = mlflow_project.summarize().frame()
+    assert set(frame["report_id"]) == {report.id}
+    restored = mlflow_project.get(frame.index.get_level_values("id")[0])
+    assert restored.id == report.id
+    assert_frame_equal(restored.metrics.rmse(), report.metrics.rmse())
+    for got, expected in zip(
+        restored.get_predictions(data_source="test"),
+        report.get_predictions(data_source="test"),
+        strict=True,
+    ):
+        assert got == pytest.approx(expected)
+
+    repeated = local.sync(mlflow_project)
+
+    assert repeated.loc[report.id, "status"] == "skipped"
+    assert bool(repeated["direction"].isna().all())
+    assert len(mlflow_project.summarize().frame()) == 1
